@@ -1,13 +1,536 @@
 Version: 1.0
 
-RestoreWorkspace: Default
-SaveWorkspace: Default
-AlwaysSaveHistory: Default
+training.dir <- "C:/Masters_Statistics_Bristol/ML/Exam/Summative Data/training"
+testing.dir <- "C:/Masters_Statistics_Bristol/ML/Exam/Summative Data/testing"
 
-EnableCodeIndexing: Yes
-UseSpacesForTab: Yes
-NumSpacesForTab: 2
-Encoding: UTF-8
+#############################
+## function for loading tab-delimited spreadsheets
+library(data.table)
+my.read.table <- function(filename, ...) {
+    cat("reading", basename(filename), "... ")
+    ## read in tab-delimited spreadsheet
+    x <- fread(
+        filename,
+        header=T,
+        stringsAsFactors=F,
+        sep="\t",
+        ...)
+    ## remove any duplicate rows (identified by the first column)
+    x <- x[match(unique(x[[1]]), x[[1]]),]
+    ## make the first column the rownames of the data frame
+    x <- data.frame(x,row.names=1,stringsAsFactors=F)
+    cat(nrow(x), "x", ncol(x), "\n")
+    x
+}
 
-RnwWeave: Sweave
-LaTeX: pdfLaTeX
+####################################
+###training###
+
+## list all files in the training dataset
+filenames <- list.files(training.dir, full.names=T)
+
+## for this example we'll omit CNV (and annotation files)
+filenames <- filenames[!grepl("cnv", filenames)]
+
+dat.filenames <- filenames[-grep("(example|annotation|targets)", filenames)]
+
+## load the data files into a list
+dat <- lapply(dat.filenames, my.read.table)
+
+## name the items of the list by the filename
+names(dat) <- sub(".txt", "", basename(dat.filenames))
+
+## Variables selection for clinical data 
+# Remove missing values for clinical data and make a temporary dataset
+missing_values <- sum(is.na(dat$clinical))
+if (missing_values > 0) {
+  # Handle missing values
+  temp.data <- na.omit(dat$clinical)  # Remove rows with missing values
+}
+
+# Perform stepwise regression
+stepwise_model <- step(lm(pfi ~ histology + 	age.at.diagnosis +	estrogen.receptor.status+
+                            progesterone.receptor.status +	her2.status +	ethnicity+	race+	
+                            positive.lymphnodes +	stage +	tnm.m.category +	tnm.n.category +	
+                            tnm.t.category+	lymphocyte.infiltration +	monocyte.infiltration +	
+                            neutrophil.infiltration +	necrosis.percent +	normal.cells.percent +
+                            stromal.cells.percent +	tumor.cells.percent , data = temp.data), direction = "forward")
+summary(stepwise_model)
+
+## clinical variables that might be informative about outcome (selected using stepwise regression)
+clinical.vars <- c("age.at.diagnosis",
+                   "progesterone.receptor.status", "estrogen.receptor.status", "lymphocyte.infiltration","necrosis.percent",
+                   "her2.status")
+
+
+## outcome variable - progression-free interval
+outcome.var <- "pfi"
+
+## remove the clinical data from the list,
+## it's a bit different than the other data files
+clinical <- dat$clinical
+dat$clinical <- NULL
+
+
+## remove features with no variance or all missing values
+for (name in names(dat)) {
+    feature.var <- apply(dat[[name]],1,var,na.rm=T)
+    dat[[name]] <- dat[[name]][which(feature.var > 2e-16),]
+}
+    
+## identify top univariate predictors in each data type
+
+library(limma)
+univariate.predictors <- sapply(names(dat), function(name) {
+    ## for each data type ...
+    cat(date(), "testing", name, "...\n")
+    ## prepare to test, for each feature, feature ~ outcome
+    outcome <- clinical$pfi[match(colnames(dat[[name]]),rownames(clinical))]
+    design <- model.matrix(~outcome)
+    ## fit linear model for each feature
+    fit <- lmFit(dat[[name]], design)
+    ## calculate p-values
+    fit <- eBayes(fit)
+    ## identify the top 100 associations
+    idx <- order(fit$p.value[,"outcome"],decreasing=F)[1:25]
+    ## return the names of the features with the top 25 associations
+    rownames(dat[[name]])[idx]
+})
+names(univariate.predictors) <- names(dat)
+
+## fit an elastic net on the samples with complete data
+## including top univariate predictors
+
+## R package providing elastic net functionality
+library(glmnet) 
+
+## convert clinical data to a numeric matrix
+##  (i.e. create dummy variables for categorical variables)
+clinical <- model.matrix(~0+., clinical[,c(outcome.var, clinical.vars)])
+
+## identify participants with data for all data types
+common.ids <- rownames(clinical)
+for (i in 1:length(dat))
+    common.ids <- intersect(common.ids, colnames(dat[[i]]))
+
+## construct a dataset including individuals with data for all data types
+## and limit to features with strong univariate associations
+univariate.dat <- sapply(names(dat), function(name) {
+    t(dat[[name]][univariate.predictors[,name],common.ids])
+}, simplify=F)
+univariate.dat$clinical <- clinical[common.ids,setdiff(colnames(clinical),outcome.var)]
+
+
+#create function for imputation and standization 
+univariate.dat <- sapply(univariate.dat, function(matrix) {
+  idx <- which(is.na(matrix),arr.ind=T)
+  median.values <- apply(matrix,2,median,na.rm=T)
+  matrix[idx] <- median.values[idx[,2]]
+  #standarize 
+  feature.var <- apply(matrix,2,var)
+  matrix <- matrix[,feature.var > 2e-16]
+  matrix <- scale(matrix)
+  matrix
+}, simplify=F)
+
+
+## outcome variable
+outcome <- clinical[common.ids,outcome.var]
+outcome=as.factor(outcome)
+
+##Load package for random forest
+library(randomForest)
+
+######################################################
+
+#########Model 1 - Clinical Features##########
+
+##exctract data into different set of features after data pre-processing 
+trainingdat1 <- univariate.dat$clinical
+
+# Fit Random Forest model
+rf_model1 <- randomForest(
+  x = trainingdat1,  # Predictors (features)
+  y = outcome,  # Outcome variable (binary)
+  ntree = 100,  # Number of trees in the forest 
+  mtry = sqrt(ncol(trainingdat1)),
+  importance = TRUE  
+)
+
+
+## apply model in the training dataset
+train.predicts1 <- predict(
+  rf_model1,
+  newx=trainingdat1,
+  s="lambda.min",
+  type="response")
+
+## check it's performance
+## area under the curve
+library(pROC)
+auc(outcome, as.numeric(train.predicts1))
+
+########Model 2 - methylation##########
+
+##extract data into different set of features after data pre-processing 
+trainingdat2 <- univariate.dat$methylation
+
+
+
+# Fit Random Forest model
+rf_model2 <- randomForest(
+  x = trainingdat2,  # Predictors (features)
+  y = outcome,  # Outcome variable (binary)
+  ntree = 100,  # Number of trees in the forest 
+  mtry = sqrt(ncol(trainingdat2)),
+  importance = TRUE  )
+
+
+## apply model in the training dataset
+train.predicts2 <- predict(
+  rf_model2,
+  newx=trainingdat2,
+  s="lambda.min",
+  type="response")
+
+## check it's performance
+## area under the curve
+library(pROC)
+auc(outcome, as.numeric(train.predicts2))
+
+########Model 3 - mirna##########
+
+##extract data into different set of features after data pre-processing 
+trainingdat3 <- univariate.dat$mirna
+
+# Fit Random Forest model
+rf_model3 <- randomForest(
+  x = trainingdat3,  # Predictors (features)
+  y = outcome,  # Outcome variable (binary)
+  ntree = 100,  # Number of trees in the forest 
+  mtry = sqrt(ncol(trainingdat3)),
+  importance = TRUE  
+)
+
+
+## apply model in the training dataset
+train.predicts3 <- predict(
+  rf_model3,
+  newx=trainingdat3,
+  s="lambda.min",
+  type="response")
+
+## check it's performance
+## area under the curve
+library(pROC)
+auc(outcome, as.numeric(train.predicts3))
+
+########Model 4 - mrna##########
+
+##extract data into different set of features after data pre-processing 
+trainingdat4 <- univariate.dat$methylation
+
+
+# Fit Random Forest model
+rf_model4 <- randomForest(
+  x = trainingdat4,  # Predictors (features)
+  y = outcome,  # Outcome variable (binary)
+  ntree = 100,  # Number of trees in the forest 
+  mtry = sqrt(ncol(trainingdat4)),
+  importance = TRUE  
+)
+
+
+## apply model in the training dataset
+train.predicts4 <- predict(
+  rf_model4,
+  newx=trainingdat4,
+  s="lambda.min",
+  type="response")
+
+## check it's performance
+## area under the curve
+library(pROC)
+auc(outcome, as.numeric(train.predicts4))
+
+########Model 5 - mutation##########
+
+##extract data into different set of features after data pre-processing 
+trainingdat5 <- univariate.dat$methylation
+
+
+# Fit Random Forest model
+rf_model5 <- randomForest(
+  x = trainingdat5,  # Predictors (features)
+  y = outcome,  # Outcome variable (binary)
+  ntree = 100,  # Number of trees in the forest
+  mtry = sqrt(ncol(trainingdat5)),
+  importance = TRUE 
+)
+
+
+## apply model in the training dataset
+train.predict5 <- predict(
+  rf_model5,
+  newdata = trainingdat5,
+  s="lambda.min",
+  type="response")
+
+## check it's performance
+## area under the curve
+library(pROC)
+auc(outcome, as.numeric(train.predict5))
+
+########Model 6 - protein##########
+
+##extract data into different set of features after data pre-processing 
+trainingdat6 <- univariate.dat$protein
+
+
+
+# Fit Random Forest model
+rf_model6 <- randomForest(
+  x = trainingdat6,  # Predictors (features)
+  y = outcome,  # Outcome variable (binary)
+  ntree = 100,  # Number of trees in the forest 
+  mtry = sqrt(ncol(trainingdat6)),
+  importance = TRUE  
+)
+
+
+## apply model in the training dataset
+train.predicts6 <- predict(
+  rf_model6,
+  newx=trainingdat6,
+  s="lambda.min",
+  type="response")
+
+## check it's performance
+## area under the curve
+library(pROC)
+auc(outcome, as.numeric(train.predicts6))
+
+########Model 7 - merging mirna and mrna##########
+
+##extract data into different set of features after data pre-processing 
+trainingdat7 <- do.call(cbind, list(univariate.dat$mirna, univariate.dat$mrna))
+
+
+
+# Fit Random Forest model
+rf_model7 <- randomForest(
+  x = trainingdat7,  # Predictors (features)
+  y = outcome,  # Outcome variable (binary)
+  ntree = 100,  # Number of trees in the forest 
+  mtry = sqrt(ncol(trainingdat7)),
+  importance = TRUE  
+)
+
+
+## apply model in the training dataset
+train.predicts7 <- predict(
+  rf_model7,
+  newdata=trainingdat7,
+  s="lambda.min",
+  type="response")
+
+## check it's performance
+## area under the curve
+library(pROC)
+auc(outcome, as.numeric(train.predicts7))
+
+
+
+########Model 8 - merging clinical and mrna##########
+
+##extract data into different set of features after data pre-processing 
+trainingdat8 <- do.call(cbind, list(univariate.dat$clinical, univariate.dat$mrna))
+
+
+
+# Fit Random Forest model
+rf_model8 <- randomForest(
+  x = trainingdat8,  # Predictors (features)
+  y = outcome,  # Outcome variable (binary)
+  ntree = 100,  # Number of trees in the forest 
+  mtry = sqrt(ncol(trainingdat8)),
+  importance = TRUE  
+)
+
+
+## apply model in the training dataset
+train.predicts8 <- predict(
+  rf_model8,
+  newx=trainingdat8,
+  s="lambda.min",
+  type="response")
+
+## check it's performance
+## area under the curve
+library(pROC)
+auc(outcome, as.numeric(train.predicts8))
+
+###############################################
+## testing
+
+
+## load the test dataset
+filenames <- list.files(testing.dir, full.names=T)
+filenames <- filenames[!grepl("cnv", filenames)] ## ignoring cnv
+test.dat <- lapply(filenames, my.read.table)
+names(test.dat) <- sub(".txt", "", basename(filenames))
+
+## extract the clinical data
+test.clinical <- test.dat$clinical
+test.dat$clinical <- NULL
+
+## convert clinical data to a numeric matrix
+## (this mainly means replacing categorical variables with dummy variables)
+test.clinical <- model.matrix(~0+., test.clinical[,c(outcome.var, clinical.vars)])
+
+## identify participants with data for all data types
+common.ids <- rownames(test.clinical)
+for (i in 1:length(test.dat))
+  common.ids <- intersect(common.ids, colnames(test.dat[[i]]))
+
+## restrict test data to univariate predictor features
+## identified in training and to individuals data for all data types
+test.dat <- sapply(names(test.dat), function(name) {
+  t(test.dat[[name]][univariate.predictors[,name],common.ids])
+}, simplify=F)
+test.dat$clinical <- test.clinical[common.ids,setdiff(colnames(test.clinical),outcome.var)]
+
+## merge data types into a single data matrix
+test.dat <- do.call(cbind, test.dat)
+
+## standardize features
+feature.medians <- apply(test.dat,2,median,na.rm=T)
+features.var <- apply(test.dat, 2, var, na.rm=T)
+test.dat <- scale(test.dat)
+
+## impute missing values with the median value for the feature
+idx <- which(is.na(test.dat),arr.ind=T)
+test.dat[idx] <- feature.medians[idx[,2]]
+
+## outcome to predict
+test.outcome <- as.vector(test.clinical[common.ids, outcome.var])
+
+##########testing for model 1 (Clinical Features)########
+
+## apply trained model in the test dataset
+test.predicts1 <- predict(
+  rf_model1,
+  newdata  = test.dat[, colnames(trainingdat1)],
+  s = "lambda.min",
+  type = "response"
+)
+
+## evaluate performance
+library(pROC)
+auc(test.outcome, as.numeric(test.predicts1))
+
+##########testing for model 2 (methylation)########
+
+## apply trained model in the test dataset
+test.predicts2<- predict(
+  rf_model2,
+  newdata  = test.dat[, colnames(trainingdat2)],
+  s = "lambda.min",
+  type = "response"
+)
+
+## evaluate performance
+library(pROC)
+auc(test.outcome, as.numeric(test.predicts2))
+
+##########testing for model 3 (mirna)########
+
+## apply trained model in the test dataset
+test.predicts3 <- predict(
+  rf_model3,
+  newdata  = test.dat[, colnames(trainingdat3)],
+  s = "lambda.min",
+  type = "response"
+)
+
+## evaluate performance
+library(pROC)
+auc(test.outcome, as.numeric(test.predicts3))
+
+##########testing for model 4 (mrna)########
+
+## apply trained model in the test dataset
+test.predicts4 <- predict(
+  rf_model4,
+  newdata  = test.dat[, colnames(trainingdat4)],
+  s = "lambda.min",
+  type = "response"
+)
+
+## evaluate performance
+library(pROC)
+auc(test.outcome, as.numeric(test.predicts4))
+
+##########testing for model 5 (mutation)########
+
+## apply trained model in the test dataset
+test.predicts5 <- predict(
+  rf_model5,
+  newdata  = test.dat[, colnames(trainingdat5)],
+  s = "lambda.min",
+  type = "response"
+)
+
+## evaluate performance
+library(pROC)
+auc(test.outcome, as.numeric(test.predicts5))
+
+##########testing for model 6 (protein)########
+
+## apply trained model in the test dataset
+test.predicts6 <- predict(
+  rf_model6,
+  newdata  = test.dat[, colnames(trainingdat6)],
+  s = "lambda.min",
+  type = "response"
+)
+
+## evaluate performance
+library(pROC)
+auc(test.outcome, as.numeric(test.predicts6))
+
+##########testing for model 7 (mirna, mrna )########
+
+## apply trained model in the test dataset
+test.predicts7 <- predict(
+  rf_model7,
+  newdata  = test.dat[, colnames(trainingdat7)],
+  s = "lambda.min",
+  type = "response"
+)
+
+## evaluate performance
+library(pROC)
+auc(test.outcome, as.numeric(test.predicts7))
+
+
+##########testing for model 8 (clinical, mrna )########
+
+## apply trained model in the test dataset
+test.predicts8 <- predict(
+  rf_model8,
+  newdata  = test.dat[, colnames(trainingdat8)],
+  s = "lambda.min",
+  type = "response"
+)
+
+## evaluate performance
+library(pROC)
+auc(test.outcome, as.numeric(test.predicts8))
+
+
+
+
+
+
+
