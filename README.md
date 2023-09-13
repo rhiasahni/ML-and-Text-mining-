@@ -1,4 +1,5 @@
-Project Compendium
+
+
 This compendium contains the code, data, and analysis for the assessment to predict breast cancer patient outcomes using clinical and multi-omic data. The assessment utilizes the dataset provided by The Cancer Genome Atlas Program.
 
 Contents:
